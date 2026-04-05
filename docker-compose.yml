@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  booking:
+    build: .
+    ports:
+      - "9800:9800"
+    volumes:
+      - booking_data:/data
+    environment:
+      - PORT=9800
+volumes:
+  booking_data:
