@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/stockyard-dev/stockyard-booking/internal/store"
 )
@@ -16,6 +18,7 @@ import (
 type Server struct {
 	db      *store.DB
 	mux     *http.ServeMux
+	limMu   sync.RWMutex // guards limits, hot-reloadable by /api/license/activate
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage // slug → personalization config
@@ -49,6 +52,7 @@ func New(db *store.DB, limits Limits, dataDir string) *Server {
 	s.mux.HandleFunc("GET /ui/", s.dashboard)
 	s.mux.HandleFunc("GET /", s.root)
 	s.mux.HandleFunc("GET /api/tier", s.tierHandler)
+	s.mux.HandleFunc("POST /api/license/activate", s.activateLicense)
 	s.mux.HandleFunc("GET /api/config", s.configHandler)
 	s.mux.HandleFunc("GET /api/extras/{resource}", s.listExtras)
 	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
@@ -125,50 +129,175 @@ func (s *Server) putExtras(w http.ResponseWriter, r *http.Request) {
 	wj(w, 200, map[string]string{"ok": "saved"})
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
-func wj(w http.ResponseWriter, c int, v any) { w.Header().Set("Content-Type", "application/json"); w.WriteHeader(c); json.NewEncoder(w).Encode(v) }
+// ServeHTTP wraps the underlying mux with a license-gate middleware.
+// In "none" or "expired" tier states, all writes (POST/PUT/DELETE/PATCH)
+// return 402 EXCEPT POST /api/license/activate (the only way out of
+// trial-required state).
+//
+// Reads are always allowed — the brand promise is that data on disk
+// stays accessible even when the license is missing or expired.
+//
+// This is the additive port: booking already has TrialLimits/PaidLimits/
+// NoLicense/ExpiredLimits states with trial_end tracking and multi-tool
+// license claims, all of which are strictly better than the simpler
+// trial-required model on the standard-shape tools. The middleware
+// preserves all of that and only adds the write-blocking behavior.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.shouldBlockWrite(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		w.Write([]byte(`{"error":"License required. Start a 14-day free trial at https://stockyard.dev/ — or paste an existing license key in the dashboard under \"Activate License\".","tier":"locked"}`))
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *Server) shouldBlockWrite(r *http.Request) bool {
+	s.limMu.RLock()
+	tier := s.limits.Tier
+	s.limMu.RUnlock()
+	// Only "none" and "expired" lock writes. "trial" and "paid" both
+	// have valid claims and full write access. Anything outside this
+	// allowlist (e.g. an unknown future tier string) defaults to allow,
+	// matching the principle of not breaking existing customers.
+	if tier != "none" && tier != "expired" {
+		return false
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	if r.URL.Path == "/api/license/activate" {
+		return false
+	}
+	return true
+}
+
+func (s *Server) activateLicense(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024))
+	if err != nil {
+		we(w, 400, "could not read request body")
+		return
+	}
+	var req struct {
+		LicenseKey string `json:"license_key"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		we(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	key := strings.TrimSpace(req.LicenseKey)
+	if key == "" {
+		we(w, 400, "license_key is required")
+		return
+	}
+	if !ValidateLicenseKeyExported(key) {
+		we(w, 400, "license key is not valid for this product — make sure you copied the entire key from the welcome email, including the SY- prefix")
+		return
+	}
+	if err := PersistLicense(s.dataDir, key); err != nil {
+		log.Printf("booking: license persist failed: %v", err)
+		we(w, 500, "could not save the license key to disk: "+err.Error())
+		return
+	}
+	// Re-resolve via DefaultLimits so the new key gets validated through
+	// the full claims pipeline (trial_end check, tool-access check, etc).
+	// This is what makes the additive port honor the existing rich
+	// license model — we don't just set tier="paid", we run the full
+	// validation again with the persisted key now in place.
+	s.limMu.Lock()
+	s.limits = DefaultLimits(s.dataDir)
+	newTier := s.limits.Tier
+	s.limMu.Unlock()
+	log.Printf("booking: license activated via dashboard, persisted to %s/%s, tier=%s", s.dataDir, licenseFilename, newTier)
+	wj(w, 200, map[string]any{
+		"ok":   true,
+		"tier": newTier,
+	})
+}
+func wj(w http.ResponseWriter, c int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(c)
+	json.NewEncoder(w).Encode(v)
+}
 func we(w http.ResponseWriter, c int, m string) { wj(w, c, map[string]string{"error": m}) }
-func (s *Server) root(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; http.Redirect(w, r, "/ui", 302) }
-func oe[T any](s []T) []T { if s == nil { return []T{} }; return s }
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/ui", 302)
+}
+func oe[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
 func init() { log.SetFlags(log.LstdFlags | log.Lshortfile) }
 
 func (s *Server) listServices(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := map[string]string{}
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"services": oe(s.db.SearchServices(q, filters))}); return }
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"services": oe(s.db.SearchServices(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"services": oe(s.db.ListServices())})
 }
 
 func (s *Server) createServices(w http.ResponseWriter, r *http.Request) {
-	if s.limits.Tier == "none" { we(w, 402, "No license key. Start a 14-day trial at https://stockyard.dev/for/"); return }
-	if s.limits.TrialExpired { we(w, 402, "Trial expired. Subscribe at https://stockyard.dev/pricing/"); return }
+	if s.limits.Tier == "none" {
+		we(w, 402, "No license key. Start a 14-day trial at https://stockyard.dev/for/")
+		return
+	}
+	if s.limits.TrialExpired {
+		we(w, 402, "Trial expired. Subscribe at https://stockyard.dev/pricing/")
+		return
+	}
 	var e store.Services
 	json.NewDecoder(r.Body).Decode(&e)
-	if e.ServiceName == "" { we(w, 400, "service_name required"); return }
+	if e.ServiceName == "" {
+		we(w, 400, "service_name required")
+		return
+	}
 	s.db.CreateServices(&e)
 	wj(w, 201, s.db.GetServices(e.ID))
 }
 
 func (s *Server) getServices(w http.ResponseWriter, r *http.Request) {
 	e := s.db.GetServices(r.PathValue("id"))
-	if e == nil { we(w, 404, "not found"); return }
+	if e == nil {
+		we(w, 404, "not found")
+		return
+	}
 	wj(w, 200, e)
 }
 
 func (s *Server) updateServices(w http.ResponseWriter, r *http.Request) {
 	existing := s.db.GetServices(r.PathValue("id"))
-	if existing == nil { we(w, 404, "not found"); return }
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
 	var patch store.Services
 	json.NewDecoder(r.Body).Decode(&patch)
-	patch.ID = existing.ID; patch.CreatedAt = existing.CreatedAt
-	if patch.ServiceName == "" { patch.ServiceName = existing.ServiceName }
-	if patch.Description == "" { patch.Description = existing.Description }
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.ServiceName == "" {
+		patch.ServiceName = existing.ServiceName
+	}
+	if patch.Description == "" {
+		patch.Description = existing.Description
+	}
 	s.db.UpdateServices(&patch)
 	wj(w, 200, s.db.GetServices(patch.ID))
 }
 
 func (s *Server) delServices(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); s.db.DeleteServices(id); s.db.DeleteExtras("services", id)
+	id := r.PathValue("id")
+	s.db.DeleteServices(id)
+	s.db.DeleteExtras("services", id)
 	wj(w, 200, map[string]string{"deleted": "ok"})
 }
 
@@ -187,47 +316,86 @@ func (s *Server) exportServices(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAppointments(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := map[string]string{}
-	if v := r.URL.Query().Get("status"); v != "" { filters["status"] = v }
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"appointments": oe(s.db.SearchAppointments(q, filters))}); return }
+	if v := r.URL.Query().Get("status"); v != "" {
+		filters["status"] = v
+	}
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"appointments": oe(s.db.SearchAppointments(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"appointments": oe(s.db.ListAppointments())})
 }
 
 func (s *Server) createAppointments(w http.ResponseWriter, r *http.Request) {
 	var e store.Appointments
 	json.NewDecoder(r.Body).Decode(&e)
-	if e.ClientName == "" { we(w, 400, "client_name required"); return }
-	if e.Date == "" { we(w, 400, "date required"); return }
-	if e.Time == "" { we(w, 400, "time required"); return }
+	if e.ClientName == "" {
+		we(w, 400, "client_name required")
+		return
+	}
+	if e.Date == "" {
+		we(w, 400, "date required")
+		return
+	}
+	if e.Time == "" {
+		we(w, 400, "time required")
+		return
+	}
 	s.db.CreateAppointments(&e)
 	wj(w, 201, s.db.GetAppointments(e.ID))
 }
 
 func (s *Server) getAppointments(w http.ResponseWriter, r *http.Request) {
 	e := s.db.GetAppointments(r.PathValue("id"))
-	if e == nil { we(w, 404, "not found"); return }
+	if e == nil {
+		we(w, 404, "not found")
+		return
+	}
 	wj(w, 200, e)
 }
 
 func (s *Server) updateAppointments(w http.ResponseWriter, r *http.Request) {
 	existing := s.db.GetAppointments(r.PathValue("id"))
-	if existing == nil { we(w, 404, "not found"); return }
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
 	var patch store.Appointments
 	json.NewDecoder(r.Body).Decode(&patch)
-	patch.ID = existing.ID; patch.CreatedAt = existing.CreatedAt
-	if patch.ClientName == "" { patch.ClientName = existing.ClientName }
-	if patch.ClientEmail == "" { patch.ClientEmail = existing.ClientEmail }
-	if patch.ClientPhone == "" { patch.ClientPhone = existing.ClientPhone }
-	if patch.Service == "" { patch.Service = existing.Service }
-	if patch.Date == "" { patch.Date = existing.Date }
-	if patch.Time == "" { patch.Time = existing.Time }
-	if patch.Status == "" { patch.Status = existing.Status }
-	if patch.Notes == "" { patch.Notes = existing.Notes }
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.ClientName == "" {
+		patch.ClientName = existing.ClientName
+	}
+	if patch.ClientEmail == "" {
+		patch.ClientEmail = existing.ClientEmail
+	}
+	if patch.ClientPhone == "" {
+		patch.ClientPhone = existing.ClientPhone
+	}
+	if patch.Service == "" {
+		patch.Service = existing.Service
+	}
+	if patch.Date == "" {
+		patch.Date = existing.Date
+	}
+	if patch.Time == "" {
+		patch.Time = existing.Time
+	}
+	if patch.Status == "" {
+		patch.Status = existing.Status
+	}
+	if patch.Notes == "" {
+		patch.Notes = existing.Notes
+	}
 	s.db.UpdateAppointments(&patch)
 	wj(w, 200, s.db.GetAppointments(patch.ID))
 }
 
 func (s *Server) delAppointments(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); s.db.DeleteAppointments(id); s.db.DeleteExtras("appointments", id)
+	id := r.PathValue("id")
+	s.db.DeleteAppointments(id)
+	s.db.DeleteExtras("appointments", id)
 	wj(w, 200, map[string]string{"deleted": "ok"})
 }
 
@@ -246,42 +414,71 @@ func (s *Server) exportAppointments(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAvailability(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := map[string]string{}
-	if v := r.URL.Query().Get("day_of_week"); v != "" { filters["day_of_week"] = v }
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"availability": oe(s.db.SearchAvailability(q, filters))}); return }
+	if v := r.URL.Query().Get("day_of_week"); v != "" {
+		filters["day_of_week"] = v
+	}
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"availability": oe(s.db.SearchAvailability(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"availability": oe(s.db.ListAvailability())})
 }
 
 func (s *Server) createAvailability(w http.ResponseWriter, r *http.Request) {
 	var e store.Availability
 	json.NewDecoder(r.Body).Decode(&e)
-	if e.DayOfWeek == "" { we(w, 400, "day_of_week required"); return }
-	if e.StartTime == "" { we(w, 400, "start_time required"); return }
-	if e.EndTime == "" { we(w, 400, "end_time required"); return }
+	if e.DayOfWeek == "" {
+		we(w, 400, "day_of_week required")
+		return
+	}
+	if e.StartTime == "" {
+		we(w, 400, "start_time required")
+		return
+	}
+	if e.EndTime == "" {
+		we(w, 400, "end_time required")
+		return
+	}
 	s.db.CreateAvailability(&e)
 	wj(w, 201, s.db.GetAvailability(e.ID))
 }
 
 func (s *Server) getAvailability(w http.ResponseWriter, r *http.Request) {
 	e := s.db.GetAvailability(r.PathValue("id"))
-	if e == nil { we(w, 404, "not found"); return }
+	if e == nil {
+		we(w, 404, "not found")
+		return
+	}
 	wj(w, 200, e)
 }
 
 func (s *Server) updateAvailability(w http.ResponseWriter, r *http.Request) {
 	existing := s.db.GetAvailability(r.PathValue("id"))
-	if existing == nil { we(w, 404, "not found"); return }
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
 	var patch store.Availability
 	json.NewDecoder(r.Body).Decode(&patch)
-	patch.ID = existing.ID; patch.CreatedAt = existing.CreatedAt
-	if patch.DayOfWeek == "" { patch.DayOfWeek = existing.DayOfWeek }
-	if patch.StartTime == "" { patch.StartTime = existing.StartTime }
-	if patch.EndTime == "" { patch.EndTime = existing.EndTime }
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.DayOfWeek == "" {
+		patch.DayOfWeek = existing.DayOfWeek
+	}
+	if patch.StartTime == "" {
+		patch.StartTime = existing.StartTime
+	}
+	if patch.EndTime == "" {
+		patch.EndTime = existing.EndTime
+	}
 	s.db.UpdateAvailability(&patch)
 	wj(w, 200, s.db.GetAvailability(patch.ID))
 }
 
 func (s *Server) delAvailability(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); s.db.DeleteAvailability(id); s.db.DeleteExtras("availability", id)
+	id := r.PathValue("id")
+	s.db.DeleteAvailability(id)
+	s.db.DeleteExtras("availability", id)
 	wj(w, 200, map[string]string{"deleted": "ok"})
 }
 
