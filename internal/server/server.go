@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/stockyard-dev/stockyard-booking/internal/store"
+	"github.com/stockyard-dev/stockyard/bus"
 )
 
 type Server struct {
@@ -22,10 +23,11 @@ type Server struct {
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage // slug → personalization config
+	bus     *bus.Bus                   // optional cross-tool event bus; nil if not configured
 }
 
-func New(db *store.DB, limits Limits, dataDir string) *Server {
-	s := &Server{db: db, mux: http.NewServeMux(), limits: limits, dataDir: dataDir}
+func New(db *store.DB, limits Limits, dataDir string, b *bus.Bus) *Server {
+	s := &Server{db: db, mux: http.NewServeMux(), limits: limits, dataDir: dataDir, bus: b}
 	s.loadPersonalConfig()
 	s.mux.HandleFunc("GET /api/services", s.listServices)
 	s.mux.HandleFunc("POST /api/services", s.createServices)
@@ -342,7 +344,13 @@ func (s *Server) createAppointments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.db.CreateAppointments(&e)
-	wj(w, 201, s.db.GetAppointments(e.ID))
+	created := s.db.GetAppointments(e.ID)
+	// All new appointments fire appointment.booked regardless of the
+	// incoming status field — the act of creation IS the booking event.
+	// Subscribers that want to filter by workflow state (e.g. only
+	// confirmed) should key off payload.status.
+	s.publishAppointment("appointment.booked", created)
+	wj(w, 201, created)
 }
 
 func (s *Server) getAppointments(w http.ResponseWriter, r *http.Request) {
@@ -389,7 +397,20 @@ func (s *Server) updateAppointments(w http.ResponseWriter, r *http.Request) {
 		patch.Notes = existing.Notes
 	}
 	s.db.UpdateAppointments(&patch)
-	wj(w, 200, s.db.GetAppointments(patch.ID))
+	updated := s.db.GetAppointments(patch.ID)
+	// Fire bus events on status TRANSITIONS only — subscribers don't
+	// want to see the same cancelled event every time an admin tweaks
+	// the notes field on a cancelled appointment. 'booked' doesn't
+	// re-fire on update; the create path owns that event.
+	if updated != nil && existing.Status != updated.Status {
+		switch strings.ToLower(updated.Status) {
+		case "cancelled", "canceled":
+			s.publishAppointment("appointment.cancelled", updated)
+		case "completed", "complete":
+			s.publishAppointment("appointment.completed", updated)
+		}
+	}
+	wj(w, 200, updated)
 }
 
 func (s *Server) delAppointments(w http.ResponseWriter, r *http.Request) {
@@ -508,4 +529,35 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	m["appointments"] = s.db.CountAppointments()
 	m["availability"] = s.db.CountAvailability()
 	wj(w, 200, m)
+}
+
+// publishAppointment fires an appointment.* event on the bus. No-op
+// when s.bus is nil (standalone mode). Runs in a goroutine so HTTP
+// responses never block. Errors are logged, never surfaced. Payload
+// shape is locked by docs/BUS-TOPICS.md v1 in stockyard-desktop.
+//
+// Reality notes: booking today stores Date + Time as separate strings
+// (not a combined RFC3339 starts_at) and has no duration or ends_at
+// field. The payload forwards date + time as-is so subscribers know
+// what to work with; a richer shape arrives when booking grows a
+// duration concept (additive change, not a breaking bump).
+func (s *Server) publishAppointment(topic string, a *store.Appointments) {
+	if s.bus == nil || a == nil {
+		return
+	}
+	payload := map[string]any{
+		"appointment_id": a.ID,
+		"client_name":    a.ClientName,
+		"client_email":   a.ClientEmail,
+		"client_phone":   a.ClientPhone,
+		"service":        a.Service,
+		"date":           a.Date,
+		"time":           a.Time,
+		"status":         a.Status,
+	}
+	go func() {
+		if _, err := s.bus.Publish(topic, payload); err != nil {
+			log.Printf("booking: bus publish %s failed: %v", topic, err)
+		}
+	}()
 }
